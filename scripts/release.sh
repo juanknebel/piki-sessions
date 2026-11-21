@@ -62,7 +62,7 @@ PY
 cargo build --all-features
 
 # Commit + tag
-git add Cargo.toml
+git add Cargo.toml Cargo.lock
 git commit -m "chore: release ${TAG}"
 git tag -a "$TAG" -m "Release ${TAG}"
 

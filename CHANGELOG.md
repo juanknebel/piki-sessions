@@ -4,6 +4,8 @@ All notable changes to this project are documented here.
 Format loosely follows Keep a Changelog.
 
 ## [Unreleased]
+
+## [0.2.0] - 2026-11-20
 ### Added
 - tmux-style TUI (`pks`): tabs, split panes, command palette, scrollback
   with search, system-metrics status bar.
