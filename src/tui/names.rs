@@ -12,6 +12,17 @@ struct NamesFile {
     sock_ctime: i64,
     next: u64,
     names: HashMap<String, String>,
+    #[serde(default)]
+    tabs: HashMap<String, TabRecord>,
+}
+
+/// A tab's pane layout, keyed by its first pane's session id (same key as
+/// `NamesFile::names`). `panes` lists every pane's session id, in order.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+struct TabRecord {
+    panes: Vec<String>,
+    #[serde(default)]
+    horizontal: bool,
 }
 
 /// Default tab names (`tab-0`, `tab-1`, …) plus persisted renames, scoped
@@ -20,6 +31,7 @@ struct NamesFile {
 pub struct TabNames {
     next: u64,
     names: HashMap<String, String>,
+    tabs: HashMap<String, TabRecord>,
     path: Option<PathBuf>,
     generation: Option<(u64, i64)>,
 }
@@ -32,6 +44,7 @@ impl TabNames {
         let mut state = Self {
             next: 0,
             names: HashMap::new(),
+            tabs: HashMap::new(),
             path: Some(path),
             generation,
         };
@@ -44,6 +57,7 @@ impl TabNames {
         {
             state.next = file.next;
             state.names = file.names;
+            state.tabs = file.tabs;
         } else {
             state.save();
         }
@@ -55,6 +69,7 @@ impl TabNames {
         Self {
             next: 0,
             names: HashMap::new(),
+            tabs: HashMap::new(),
             path: None,
             generation: None,
         }
@@ -92,9 +107,47 @@ impl TabNames {
     }
 
     /// Drop names of sessions the daemon no longer lists.
+    ///
+    /// A tab record is keyed by its first pane's session id (same as the
+    /// name map): if that pane is gone, the whole record — and with it the
+    /// tab's grouping of any surviving panes — is dropped too. Narrower than
+    /// ideal, but matches `Tab::id`'s own lifetime today.
     pub fn prune(&mut self, live: &HashSet<String>) {
         self.names.retain(|id, _| live.contains(id));
+        self.tabs.retain(|id, rec| {
+            rec.panes.retain(|p| live.contains(p));
+            live.contains(id) && !rec.panes.is_empty()
+        });
         self.save();
+    }
+
+    /// Persist (or replace) a tab's pane layout: `tab_id` is its first
+    /// pane's session id, `panes` every pane's session id in order.
+    pub fn set_panes(&mut self, tab_id: &str, panes: &[String], horizontal: bool) {
+        self.tabs.insert(
+            tab_id.to_string(),
+            TabRecord {
+                panes: panes.to_vec(),
+                horizontal,
+            },
+        );
+        self.save();
+    }
+
+    /// The persisted pane order for a tab, if any was recorded.
+    pub fn panes_for(&self, tab_id: &str) -> Option<&[String]> {
+        self.tabs.get(tab_id).map(|r| r.panes.as_slice())
+    }
+
+    /// The persisted split direction for a tab (vertical by default).
+    pub fn horizontal_for(&self, tab_id: &str) -> bool {
+        self.tabs.get(tab_id).map(|r| r.horizontal).unwrap_or(false)
+    }
+
+    /// Every persisted tab id with its ordered pane ids, for reverse lookup
+    /// (which tab does a given pane id belong to) during reattach.
+    pub fn all_tabs(&self) -> impl Iterator<Item = (&String, &Vec<String>)> {
+        self.tabs.iter().map(|(id, r)| (id, &r.panes))
     }
 
     fn save(&self) {
@@ -114,6 +167,7 @@ impl TabNames {
             sock_ctime: ctime,
             next: self.next,
             names: self.names.clone(),
+            tabs: self.tabs.clone(),
         };
         let Ok(text) = serde_json::to_string(&file) else {
             return;
@@ -227,6 +281,53 @@ mod tests {
         let mut names = TabNames::load(path.clone(), &sock);
         assert_eq!(names.assign(Some("aaa")), "tab-2");
         assert_eq!(names.assign(Some("bbb")), "tab-1");
+        cleanup(&[sock, path]);
+    }
+
+    #[test]
+    fn pane_group_persists_across_reload() {
+        let sock = test_socket("panes");
+        let path = test_path("panes.json");
+        let mut names = TabNames::load(path.clone(), &sock);
+        names.set_panes("aaa", &["aaa".to_string(), "bbb".to_string()], true);
+        drop(names);
+        let names = TabNames::load(path.clone(), &sock);
+        assert_eq!(
+            names.panes_for("aaa"),
+            Some(["aaa".to_string(), "bbb".to_string()].as_slice())
+        );
+        assert!(names.horizontal_for("aaa"));
+        cleanup(&[sock, path]);
+    }
+
+    #[test]
+    fn prune_drops_dead_panes_but_keeps_surviving_group() {
+        let sock = test_socket("prune-panes");
+        let path = test_path("prune-panes.json");
+        let mut names = TabNames::load(path.clone(), &sock);
+        names.set_panes(
+            "aaa",
+            &["aaa".to_string(), "bbb".to_string(), "ccc".to_string()],
+            false,
+        );
+        // "bbb" exited; "aaa" (the tab id) and "ccc" are still live.
+        names.prune(&HashSet::from(["aaa".to_string(), "ccc".to_string()]));
+        assert_eq!(
+            names.panes_for("aaa"),
+            Some(["aaa".to_string(), "ccc".to_string()].as_slice())
+        );
+        cleanup(&[sock, path]);
+    }
+
+    #[test]
+    fn prune_drops_group_when_tab_id_dies() {
+        let sock = test_socket("prune-group");
+        let path = test_path("prune-group.json");
+        let mut names = TabNames::load(path.clone(), &sock);
+        names.set_panes("aaa", &["aaa".to_string(), "bbb".to_string()], false);
+        // The tab's first pane ("aaa") exited, even though "bbb" survives.
+        names.prune(&HashSet::from(["bbb".to_string()]));
+        assert_eq!(names.panes_for("aaa"), None);
         cleanup(&[sock, path]);
     }
 }

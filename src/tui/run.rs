@@ -81,26 +81,88 @@ pub fn run() -> anyhow::Result<()> {
         cols,
     };
 
-    // Initial tabs: reattach daemon sessions or create one.
+    // Initial tabs: reattach daemon sessions, grouped back into their
+    // original multi-pane tabs where we persisted that layout, or create one.
     let mut tabs: Vec<Tab> = if let Some(d) = &daemon {
         let mut ts = Vec::new();
         if let Ok(sessions) = d.list() {
             names.prune(&sessions.iter().map(|s| s.id.clone()).collect());
-            for info in sessions {
-                if let Ok(att) = d.attach(&info.id, pty_rows, cols) {
-                    let session =
-                        PtySession::from_attachment(att, true, None, Some(signal.clone()));
-                    ts.push(Tab {
-                        panes: vec![Pane {
-                            session,
-                            name: default_name(&info.command),
-                        }],
-                        focus: 0,
-                        split: SplitDir::Vertical,
-                        name: names.assign(Some(&info.id)),
-                        id: Some(info.id),
-                    });
+
+            // Exited sessions have nothing live to reattach to; only live
+            // ones get regrouped into tabs below.
+            let live_ids: std::collections::HashSet<String> = sessions
+                .iter()
+                .filter(|s| s.state.is_live())
+                .map(|s| s.id.clone())
+                .collect();
+
+            // Reverse index: a pane's session id -> the tab id (its tab's
+            // first pane) it was persisted under, so panes attach in the
+            // order they're found instead of one tab per session.
+            let mut member_of: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            for (tab_id, pane_ids) in names.all_tabs() {
+                for pid in pane_ids {
+                    member_of.insert(pid.clone(), tab_id.clone());
                 }
+            }
+
+            let mut seen_tabs = std::collections::HashSet::new();
+            for info in &sessions {
+                if !live_ids.contains(&info.id) {
+                    continue;
+                }
+                let tab_id = member_of
+                    .get(&info.id)
+                    .cloned()
+                    .unwrap_or_else(|| info.id.clone());
+                if !seen_tabs.insert(tab_id.clone()) {
+                    continue;
+                }
+                let pane_ids: Vec<String> = names
+                    .panes_for(&tab_id)
+                    .map(|ids| {
+                        ids.iter()
+                            .filter(|id| live_ids.contains(*id))
+                            .cloned()
+                            .collect()
+                    })
+                    .filter(|ids: &Vec<String>| !ids.is_empty())
+                    .unwrap_or_else(|| vec![info.id.clone()]);
+
+                let mut panes = Vec::new();
+                for pid in &pane_ids {
+                    let Some(pinfo) = sessions.iter().find(|s| &s.id == pid) else {
+                        continue;
+                    };
+                    if let Ok(att) = d.attach(pid, pty_rows, cols) {
+                        let session =
+                            PtySession::from_attachment(att, true, None, Some(signal.clone()));
+                        panes.push(Pane {
+                            session,
+                            name: default_name(&pinfo.command),
+                            id: Some(pid.clone()),
+                        });
+                    }
+                }
+                if panes.is_empty() {
+                    continue;
+                }
+                let horizontal = names.horizontal_for(&tab_id);
+                // Re-register the group (covers legacy/ungrouped sessions
+                // from before this persisted, so future restarts regroup).
+                names.set_panes(&tab_id, &pane_ids, horizontal);
+                ts.push(Tab {
+                    panes,
+                    focus: 0,
+                    split: if horizontal {
+                        SplitDir::Horizontal
+                    } else {
+                        SplitDir::Vertical
+                    },
+                    name: names.assign(Some(&tab_id)),
+                    id: Some(tab_id),
+                });
             }
         }
         if ts.is_empty() {

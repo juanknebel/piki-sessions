@@ -18,6 +18,9 @@ pub enum SplitDir {
 pub struct Pane {
     pub session: piki_multiplex::pty::PtySession,
     pub name: String,
+    /// Daemon session id backing this pane (`None` when local). Lets a tab
+    /// persist which sessions are its panes, so a restart can regroup them.
+    pub id: Option<String>,
 }
 
 pub struct Tab {

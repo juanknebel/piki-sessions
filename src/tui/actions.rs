@@ -155,7 +155,7 @@ impl Command {
             Command::NextTab => cmd_next_tab(ctx.tabs, ctx.active),
             Command::PrevTab => cmd_prev_tab(ctx.tabs, ctx.active),
             Command::Close => {
-                if cmd_close(ctx.tabs, ctx.active) {
+                if cmd_close(ctx.tabs, ctx.active, ctx.names) {
                     *ctx.quit = true;
                 }
             }
@@ -165,10 +165,10 @@ impl Command {
             }
             Command::ScrollMode => *ctx.scroll_mode = true,
             Command::SplitVertical => {
-                cmd_split(ctx.tabs, *ctx.active, SplitDir::Vertical, ctx.spawn)
+                cmd_split(ctx.tabs, *ctx.active, SplitDir::Vertical, ctx.spawn, ctx.names)
             }
             Command::SplitHorizontal => {
-                cmd_split(ctx.tabs, *ctx.active, SplitDir::Horizontal, ctx.spawn)
+                cmd_split(ctx.tabs, *ctx.active, SplitDir::Horizontal, ctx.spawn, ctx.names)
             }
             Command::NextPane => cmd_next_pane(ctx.tabs, *ctx.active),
             Command::Quit => *ctx.quit = true,
@@ -311,10 +311,14 @@ pub fn new_tab(ctx: &SpawnCtx, names: &mut TabNames) -> anyhow::Result<Tab> {
         .map(|_| piki_multiplex::session::new_session_id());
     let session = spawn_session(ctx, id.clone())?;
     let name = names.assign(id.as_deref());
+    if let Some(id) = &id {
+        names.set_panes(id, std::slice::from_ref(id), false);
+    }
     Ok(Tab {
         panes: vec![Pane {
             session,
             name: default_name(ctx.cmd),
+            id: id.clone(),
         }],
         focus: 0,
         split: SplitDir::Vertical,
@@ -330,11 +334,12 @@ fn cmd_new_tab(tabs: &mut Vec<Tab>, active: &mut usize, ctx: &SpawnCtx, names: &
     }
 }
 
-fn cmd_split(tabs: &mut [Tab], active: usize, dir: SplitDir, ctx: &SpawnCtx) {
+fn cmd_split(tabs: &mut [Tab], active: usize, dir: SplitDir, ctx: &SpawnCtx, names: &mut TabNames) {
     let Some(tab) = tabs.get_mut(active) else {
         return;
     };
-    let session = match spawn_session(ctx, None) {
+    let new_id = ctx.daemon.map(|_| piki_multiplex::session::new_session_id());
+    let session = match spawn_session(ctx, new_id.clone()) {
         Ok(s) => s,
         Err(_) => return,
     };
@@ -342,13 +347,20 @@ fn cmd_split(tabs: &mut [Tab], active: usize, dir: SplitDir, ctx: &SpawnCtx) {
     tab.panes.push(Pane {
         session,
         name: default_name(ctx.cmd),
+        id: new_id,
     });
     tab.focus = tab.panes.len() - 1;
+    // Keep the persisted pane group in sync so a restart can regroup these
+    // panes under one tab instead of scattering them.
+    if let Some(tab_id) = &tab.id {
+        let pane_ids: Vec<String> = tab.panes.iter().filter_map(|p| p.id.clone()).collect();
+        names.set_panes(tab_id, &pane_ids, matches!(tab.split, SplitDir::Horizontal));
+    }
 }
 
 /// Close the focused pane, else the current tab.
 /// Returns true when the last tab was closed (caller should quit).
-fn cmd_close(tabs: &mut Vec<Tab>, active: &mut usize) -> bool {
+fn cmd_close(tabs: &mut Vec<Tab>, active: &mut usize, names: &mut TabNames) -> bool {
     if tabs.is_empty() {
         return true;
     }
@@ -361,6 +373,17 @@ fn cmd_close(tabs: &mut Vec<Tab>, active: &mut usize) -> bool {
         tabs[*active].panes.remove(idx);
         if tabs[*active].focus >= tabs[*active].panes.len() {
             tabs[*active].focus = tabs[*active].panes.len().saturating_sub(1);
+        }
+        // Trim the persisted group now rather than waiting for the next
+        // restart's prune to notice the killed pane is gone.
+        if let Some(tab_id) = &tabs[*active].id {
+            let pane_ids: Vec<String> = tabs[*active]
+                .panes
+                .iter()
+                .filter_map(|p| p.id.clone())
+                .collect();
+            let horizontal = matches!(tabs[*active].split, SplitDir::Horizontal);
+            names.set_panes(tab_id, &pane_ids, horizontal);
         }
         false
     } else if tabs.len() > 1 {
