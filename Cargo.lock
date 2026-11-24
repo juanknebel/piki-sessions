@@ -1182,6 +1182,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tui-term",
+ "vt100",
 ]
 
 [[package]]

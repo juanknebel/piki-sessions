@@ -324,6 +324,7 @@ pub fn new_tab(ctx: &SpawnCtx, names: &mut TabNames) -> anyhow::Result<Tab> {
         split: SplitDir::Vertical,
         name,
         id,
+        sizes: Vec::new(),
     })
 }
 
@@ -343,6 +344,7 @@ fn cmd_split(tabs: &mut [Tab], active: usize, dir: SplitDir, ctx: &SpawnCtx, nam
         Ok(s) => s,
         Err(_) => return,
     };
+    let old_focus = tab.focus;
     tab.split = dir;
     tab.panes.push(Pane {
         session,
@@ -350,6 +352,16 @@ fn cmd_split(tabs: &mut [Tab], active: usize, dir: SplitDir, ctx: &SpawnCtx, nam
         id: new_id,
     });
     tab.focus = tab.panes.len() - 1;
+    // Give the new pane half the old focused pane's space instead of
+    // rebalancing every pane; `run()` resets to an even split anyway if
+    // this ever falls out of sync with the pane count.
+    if tab.sizes.len() == tab.panes.len() - 1
+        && let Some(old) = tab.sizes.get_mut(old_focus)
+    {
+        let half = *old / 2;
+        *old -= half;
+        tab.sizes.push(half.max(1));
+    }
     // Keep the persisted pane group in sync so a restart can regroup these
     // panes under one tab instead of scattering them.
     if let Some(tab_id) = &tab.id {
@@ -374,6 +386,16 @@ fn cmd_close(tabs: &mut Vec<Tab>, active: &mut usize, names: &mut TabNames) -> b
         if tabs[*active].focus >= tabs[*active].panes.len() {
             tabs[*active].focus = tabs[*active].panes.len().saturating_sub(1);
         }
+        // Give the closed pane's space to its neighbor instead of
+        // rebalancing everyone; falls back to an even split (via `run()`)
+        // if this was already out of sync with the pane count.
+        if tabs[*active].sizes.len() == tabs[*active].panes.len() + 1 {
+            let freed = tabs[*active].sizes.remove(idx);
+            let neighbor = idx.min(tabs[*active].sizes.len().saturating_sub(1));
+            if let Some(s) = tabs[*active].sizes.get_mut(neighbor) {
+                *s += freed;
+            }
+        }
         // Trim the persisted group now rather than waiting for the next
         // restart's prune to notice the killed pane is gone.
         if let Some(tab_id) = &tabs[*active].id {
@@ -394,6 +416,10 @@ fn cmd_close(tabs: &mut Vec<Tab>, active: &mut usize, names: &mut TabNames) -> b
         }
         false
     } else {
+        // Last tab, last pane: still an explicit close, so kill it too —
+        // only the "quit after this" signal is special here, not whether
+        // the session should die.
+        let _ = tabs[*active].session_mut().kill();
         true
     }
 }

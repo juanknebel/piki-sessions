@@ -20,10 +20,27 @@ use super::actions::{
     Command, ExecCtx, RenameState, SpawnCtx, cmd_select_tab, default_name, filtered_commands,
     flat_panes, new_tab, pane_counts,
 };
-use super::helpers::{TerminalGuard, data_dir, key_to_bytes, launch_daemon, marker_span};
+use super::helpers::{
+    TerminalGuard, data_dir, hit, key_to_bytes, launch_daemon, marker_span, mouse_to_bytes,
+    normalize_sizes,
+};
 use super::metrics::{read_battery, read_cpu_sample, read_mem_info};
 use super::names::TabNames;
 use super::{Pane, SplitDir, Tab};
+
+/// Minimum cells a pane can be dragged down to, so a resize can't collapse
+/// one away (use Close for that).
+const MIN_PANE_SIZE: u16 = 4;
+
+/// An in-progress gutter drag: which gutter (between pane `gutter` and
+/// `gutter + 1`), the pointer coordinate where the drag started, and the
+/// two panes' sizes at that moment (so the resize is computed from the
+/// total drag distance, not accumulated per-event deltas).
+struct ResizeState {
+    gutter: usize,
+    anchor: u16,
+    orig: (u16, u16),
+}
 
 /// Border for a pane: only the focused pane of a multi-pane tab gets one.
 /// Single-pane tabs render borderless at full area.
@@ -162,6 +179,7 @@ pub fn run() -> anyhow::Result<()> {
                     },
                     name: names.assign(Some(&tab_id)),
                     id: Some(tab_id),
+                    sizes: Vec::new(),
                 });
             }
         }
@@ -195,6 +213,14 @@ pub fn run() -> anyhow::Result<()> {
     let mut search_mode = false;
     let mut search_query = String::new();
     let mut quit = false;
+    // Hit-test targets from the last draw, for mouse input (focus-click,
+    // tab-bar click, gutter drag). Populated before the first input poll
+    // since a draw always runs first in each loop iteration.
+    let mut last_pane_areas: Vec<Rect> = Vec::new();
+    let mut last_pane_inner_areas: Vec<Rect> = Vec::new();
+    let mut last_gutter_areas: Vec<Rect> = Vec::new();
+    let mut last_tab_label_rects: Vec<Rect> = Vec::new();
+    let mut resizing: Option<ResizeState> = None;
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -258,128 +284,174 @@ pub fn run() -> anyhow::Result<()> {
         let bat_cap_r = &bat_cap;
         let bat_status_r = &bat_status;
         if needs_draw {
-            terminal.draw(|f| {
-                let area = f.area();
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Min(1), Constraint::Length(1)])
-                    .split(area);
+            let size = terminal.size()?;
+            let area = Rect::new(0, 0, size.width, size.height);
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(1), Constraint::Length(1)])
+                .split(area);
+            let main_area = chunks[0];
+            let status_area = chunks[1];
 
-                let tab = &tabs[active];
-                let n = tab.panes.len().max(1);
-                let pane_areas = if n == 1 {
-                    vec![chunks[0]]
-                } else {
-                    let dir = match tab.split {
-                        SplitDir::Horizontal => Direction::Horizontal,
-                        SplitDir::Vertical => Direction::Vertical,
-                    };
-                    Layout::default()
-                        .direction(dir)
-                        .constraints(vec![Constraint::Ratio(1, n as u32); n])
-                        .split(chunks[0])
-                        .to_vec()
+            // Pane layout for the active tab: panes get `sizes` cells along
+            // the split direction with a 1-cell gutter between consecutive
+            // ones (click-to-focus and drag-to-resize hit-test against
+            // these rects, computed once here rather than inside the
+            // draw closure, since input handling needs them afterwards).
+            let n = tabs[active].panes.len().max(1);
+            let split_dir = match tabs[active].split {
+                SplitDir::Horizontal => Direction::Horizontal,
+                SplitDir::Vertical => Direction::Vertical,
+            };
+            let (pane_areas, gutter_areas): (Vec<Rect>, Vec<Rect>) = if n <= 1 {
+                (vec![main_area], Vec::new())
+            } else {
+                let total_dim = match split_dir {
+                    Direction::Horizontal => main_area.width,
+                    _ => main_area.height,
                 };
+                let usable = total_dim.saturating_sub(n as u16 - 1);
+                normalize_sizes(&mut tabs[active].sizes, n, usable);
+                let mut constraints = Vec::with_capacity(n * 2 - 1);
+                for (i, &s) in tabs[active].sizes.iter().enumerate() {
+                    if i > 0 {
+                        constraints.push(Constraint::Length(1));
+                    }
+                    constraints.push(Constraint::Length(s));
+                }
+                let areas = Layout::default()
+                    .direction(split_dir)
+                    .constraints(constraints)
+                    .split(main_area);
+                let panes = areas.iter().step_by(2).copied().collect();
+                let gutters = areas.iter().skip(1).step_by(2).copied().collect();
+                (panes, gutters)
+            };
+            let pane_inner_areas: Vec<Rect> = pane_areas
+                .iter()
+                .enumerate()
+                .map(|(i, &a)| {
+                    let title = (n > 1).then_some(tabs[active].panes[i].name.as_str());
+                    pane_border(n, tabs[active].focus, i, title)
+                        .map(|b| b.inner(a))
+                        .unwrap_or(a)
+                })
+                .collect();
+
+            // Status bar: each tab gets its own clickable label (tracked by
+            // screen rect, in the same order they're drawn) alongside the
+            // agent/pane/prefix/scroll indicators.
+            let agent_status = tabs[active]
+                .session()
+                .shell()
+                .map(|sh| {
+                    let s = sh.lock();
+                    if s.state.sidecar.is_some() {
+                        "active"
+                    } else {
+                        "idle"
+                    }
+                })
+                .unwrap_or("idle")
+                .to_string();
+            let agent_label = format!(" 🤖 agent: {} ", agent_status);
+            let mut status_spans = vec![
+                Span::styled(agent_label.clone(), Style::default().fg(Color::Green)),
+                Span::styled(" │", Style::default().fg(Color::DarkGray)),
+            ];
+            let mut tab_label_rects = Vec::with_capacity(tabs.len());
+            let mut label_x = status_area.x + agent_label.chars().count() as u16 + 2;
+            for (i, t) in tabs.iter().enumerate() {
+                let label = format!(" {}:{} ", i + 1, t.name);
+                let width = label.chars().count() as u16;
+                tab_label_rects.push(Rect::new(label_x, status_area.y, width, 1));
+                label_x += width;
+                let style = if i == active {
+                    Style::default().fg(Color::Black).bg(Color::Cyan)
+                } else {
+                    Style::default().fg(Color::Cyan)
+                };
+                status_spans.push(Span::styled(label, style));
+            }
+            let pane_span = Span::styled(
+                format!(
+                    " │ pane {}/{}: {} ",
+                    tabs[active].focus + 1,
+                    tabs[active].panes.len(),
+                    tabs[active].panes[tabs[active].focus].name
+                ),
+                Style::default().fg(Color::Magenta),
+            );
+            let prefix_span = if prefix_pending {
+                Span::styled(
+                    " │ prefix: ON ",
+                    Style::default().fg(Color::Black).bg(Color::Yellow),
+                )
+            } else {
+                Span::styled(" │ prefix: off ", Style::default().fg(Color::DarkGray))
+            };
+            let scroll_span = if scroll_mode {
+                Span::styled(
+                    " │ SCROLL ",
+                    Style::default().fg(Color::Black).bg(Color::Cyan),
+                )
+            } else {
+                Span::styled("", Style::default())
+            };
+            let metrics = if let Some(c) = *bat_cap_r {
+                format!(
+                    "🔋 {}% {} │ CPU {:.0}% │ MEM {:.1}/{:.1}GB",
+                    c, bat_status_r, *cpu_usage_r, *mem_used_r, *mem_total_r
+                )
+            } else {
+                format!(
+                    "CPU {:.0}% │ MEM {:.1}/{:.1}GB",
+                    *cpu_usage_r, *mem_used_r, *mem_total_r
+                )
+            };
+            if tabs[active].panes.len() > 1 {
+                status_spans.push(pane_span);
+            }
+            status_spans.push(prefix_span);
+            status_spans.push(scroll_span);
+            let left_para = Paragraph::new(Line::from(status_spans));
+            let right_para = Paragraph::new(metrics)
+                .alignment(Alignment::Right)
+                .style(Style::default().fg(Color::Yellow));
+            let status_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(0), Constraint::Length(28)])
+                .split(status_area);
+
+            last_pane_areas = pane_areas.clone();
+            last_pane_inner_areas = pane_inner_areas.clone();
+            last_gutter_areas = gutter_areas.clone();
+            last_tab_label_rects = tab_label_rects;
+
+            terminal.draw(|f| {
+                let tab = &tabs[active];
                 for (i, pane) in tab.panes.iter().enumerate() {
                     let area = pane_areas[i];
+                    let inner = pane_inner_areas[i];
                     let title = (tab.panes.len() > 1).then_some(pane.name.as_str());
-                    if let Some(block) = pane_border(tab.panes.len(), tab.focus, i, title) {
-                        let inner = block.inner(area);
-                        if inner.width >= 4 && inner.height >= 4 {
-                            let _ = pane.session.resize(inner.height, inner.width);
-                        }
-                        let parser = pane.session.parser().lock();
-                        let pt = PseudoTerminal::new(parser.screen());
-                        f.render_widget(block, area);
-                        f.render_widget(pt, inner);
-                    } else {
-                        if area.width >= 4 && area.height >= 4 {
-                            let _ = pane.session.resize(area.height, area.width);
-                        }
-                        let parser = pane.session.parser().lock();
-                        let pt = PseudoTerminal::new(parser.screen());
-                        f.render_widget(pt, area);
+                    if inner.width >= 4 && inner.height >= 4 {
+                        let _ = pane.session.resize(inner.height, inner.width);
                     }
+                    let parser = pane.session.parser().lock();
+                    let pt = PseudoTerminal::new(parser.screen());
+                    if let Some(block) = pane_border(tab.panes.len(), tab.focus, i, title) {
+                        f.render_widget(block, area);
+                    }
+                    f.render_widget(pt, inner);
+                }
+                // Thin divider between panes, doubling as the resize handle.
+                for g in &gutter_areas {
+                    f.render_widget(
+                        Block::default().style(Style::default().bg(Color::DarkGray)),
+                        *g,
+                    );
                 }
 
-                // Clean layout: terminal + status bar
-                let agent_status = tabs[active]
-                    .session()
-                    .shell()
-                    .map(|sh| {
-                        let s = sh.lock();
-                        if s.state.sidecar.is_some() {
-                            "active"
-                        } else {
-                            "idle"
-                        }
-                    })
-                    .unwrap_or("idle")
-                    .to_string();
-                let agent_span = Span::styled(
-                    format!(" 🤖 agent: {} ", agent_status),
-                    Style::default().fg(Color::Green),
-                );
-                let tab_span = Span::styled(
-                    format!(
-                        " │ tab {}/{}: {} ",
-                        active + 1,
-                        tabs.len(),
-                        tabs[active].name
-                    ),
-                    Style::default().fg(Color::Cyan),
-                );
-                let pane_span = Span::styled(
-                    format!(
-                        " │ pane {}/{}: {} ",
-                        tabs[active].focus + 1,
-                        tabs[active].panes.len(),
-                        tabs[active].panes[tabs[active].focus].name
-                    ),
-                    Style::default().fg(Color::Magenta),
-                );
-                let prefix_span = if prefix_pending {
-                    Span::styled(
-                        " │ prefix: ON ",
-                        Style::default().fg(Color::Black).bg(Color::Yellow),
-                    )
-                } else {
-                    Span::styled(" │ prefix: off ", Style::default().fg(Color::DarkGray))
-                };
-                let scroll_span = if scroll_mode {
-                    Span::styled(
-                        " │ SCROLL ",
-                        Style::default().fg(Color::Black).bg(Color::Cyan),
-                    )
-                } else {
-                    Span::styled("", Style::default())
-                };
-                let metrics = if let Some(c) = *bat_cap_r {
-                    format!(
-                        "🔋 {}% {} │ CPU {:.0}% │ MEM {:.1}/{:.1}GB",
-                        c, bat_status_r, *cpu_usage_r, *mem_used_r, *mem_total_r
-                    )
-                } else {
-                    format!(
-                        "CPU {:.0}% │ MEM {:.1}/{:.1}GB",
-                        *cpu_usage_r, *mem_used_r, *mem_total_r
-                    )
-                };
-                let mut spans = vec![agent_span, tab_span];
-                if tabs[active].panes.len() > 1 {
-                    spans.push(pane_span);
-                }
-                spans.push(prefix_span);
-                spans.push(scroll_span);
-                let left_line = Line::from(spans);
-                let left_para = Paragraph::new(left_line);
-                let right_para = Paragraph::new(metrics)
-                    .alignment(Alignment::Right)
-                    .style(Style::default().fg(Color::Yellow));
-                let status_chunks = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Min(0), Constraint::Length(28)])
-                    .split(chunks[1]);
                 f.render_widget(left_para, status_chunks[0]);
                 f.render_widget(right_para, status_chunks[1]);
                 if tabs_open {
@@ -535,7 +607,99 @@ pub fn run() -> anyhow::Result<()> {
                     if tabs.is_empty() {
                         continue;
                     }
+
+                    // An in-progress gutter drag claims every event until
+                    // release, regardless of where the pointer lands.
+                    if let Some(r) = &resizing {
+                        match me.kind {
+                            crossterm::event::MouseEventKind::Drag(_) => {
+                                if let Some(tab) = tabs.get_mut(active) {
+                                    let current = match tab.split {
+                                        SplitDir::Horizontal => me.column,
+                                        SplitDir::Vertical => me.row,
+                                    };
+                                    apply_resize(&mut tab.sizes, r, current);
+                                }
+                            }
+                            crossterm::event::MouseEventKind::Up(_) => resizing = None,
+                            // Anything else means the drag ended without a
+                            // clean release (e.g. focus loss) — don't get stuck.
+                            _ => resizing = None,
+                        }
+                        continue;
+                    }
+
+                    // The tab bar is modal to clicks: a hit there always
+                    // just switches tabs, nothing else.
+                    if matches!(me.kind, crossterm::event::MouseEventKind::Down(_))
+                        && let Some(idx) = last_tab_label_rects
+                            .iter()
+                            .position(|r| hit(r, me.column, me.row))
+                    {
+                        active = idx;
+                        continue;
+                    }
+                    if active >= tabs.len() {
+                        continue;
+                    }
+
+                    // A click on a gutter starts resizing instead of
+                    // anything else (focus, passthrough, scroll).
+                    if me.kind
+                        == crossterm::event::MouseEventKind::Down(
+                            crossterm::event::MouseButton::Left,
+                        )
+                        && let Some(g) = last_gutter_areas
+                            .iter()
+                            .position(|r| hit(r, me.column, me.row))
+                        && let (Some(&a), Some(&b)) =
+                            (tabs[active].sizes.get(g), tabs[active].sizes.get(g + 1))
+                    {
+                        let anchor = match tabs[active].split {
+                            SplitDir::Horizontal => me.column,
+                            SplitDir::Vertical => me.row,
+                        };
+                        resizing = Some(ResizeState {
+                            gutter: g,
+                            anchor,
+                            orig: (a, b),
+                        });
+                        continue;
+                    }
+
+                    // A click focuses whichever pane it lands in.
+                    if matches!(me.kind, crossterm::event::MouseEventKind::Down(_))
+                        && tabs[active].panes.len() > 1
+                        && let Some(idx) =
+                            last_pane_areas.iter().position(|r| hit(r, me.column, me.row))
+                    {
+                        tabs[active].focus = idx;
+                    }
+
+                    // Forward to the focused pane's app when it has asked
+                    // for mouse reporting and the pointer is on its content
+                    // (not its border/title); otherwise fall back to
+                    // scrollback / the arrow-key heuristic for plain apps.
+                    let focus = tabs[active].focus;
                     let session = tabs[active].session();
+                    let forwarded = last_pane_inner_areas.get(focus).and_then(|inner| {
+                        if !hit(inner, me.column, me.row) {
+                            return None;
+                        }
+                        let col = me.column - inner.x + 1;
+                        let row = me.row - inner.y + 1;
+                        let (mode, encoding) = {
+                            let parser = session.parser().lock();
+                            let screen = parser.screen();
+                            (screen.mouse_protocol_mode(), screen.mouse_protocol_encoding())
+                        };
+                        mouse_to_bytes(me, mode, encoding, col, row)
+                    });
+                    if let Some(bytes) = forwarded {
+                        let _ = session.write(&bytes);
+                        continue;
+                    }
+
                     let is_alt = session.parser().lock().screen().alternate_screen();
                     match me.kind {
                         crossterm::event::MouseEventKind::ScrollUp => {
@@ -945,6 +1109,27 @@ fn exec_cmd(
     });
 }
 
+/// Resize the gutter's two neighboring panes from the drag's total distance
+/// (not accumulated per-event deltas, so there's no rounding drift), keeping
+/// their combined space constant and each one at least `MIN_PANE_SIZE`.
+fn apply_resize(sizes: &mut [u16], state: &ResizeState, current: u16) {
+    let (orig_a, orig_b) = state.orig;
+    let total = orig_a as i32 + orig_b as i32;
+    if total <= 2 * MIN_PANE_SIZE as i32 {
+        return;
+    }
+    let delta = current as i32 - state.anchor as i32;
+    let min = MIN_PANE_SIZE as i32;
+    let new_a = (orig_a as i32 + delta).clamp(min, total - min) as u16;
+    let new_b = (total - new_a as i32) as u16;
+    if let Some(s) = sizes.get_mut(state.gutter) {
+        *s = new_a;
+    }
+    if let Some(s) = sizes.get_mut(state.gutter + 1) {
+        *s = new_b;
+    }
+}
+
 /// Forward Ctrl+G + key to the focused shell (unknown prefix command).
 fn forward_to_shell(tabs: &[Tab], active: usize, key: crossterm::event::KeyEvent) {
     if let Some(bytes) = key_to_bytes(key) {
@@ -979,7 +1164,7 @@ fn copy_to_clipboard(text: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::pane_border;
+    use super::{ResizeState, apply_resize, pane_border};
 
     #[test]
     fn solo_pane_has_no_border() {
@@ -991,5 +1176,57 @@ mod tests {
         assert!(pane_border(3, 1, 1, Some("ed")).is_some());
         assert!(pane_border(3, 1, 0, Some("sh")).is_none());
         assert!(pane_border(3, 1, 2, None).is_none());
+    }
+
+    #[test]
+    fn resize_moves_the_boundary_by_the_full_drag_distance() {
+        let mut sizes = vec![20, 20];
+        let state = ResizeState {
+            gutter: 0,
+            anchor: 10,
+            orig: (20, 20),
+        };
+        apply_resize(&mut sizes, &state, 15); // dragged 5 cells right
+        assert_eq!(sizes, vec![25, 15]);
+    }
+
+    #[test]
+    fn resize_does_not_drift_across_repeated_drag_events() {
+        // Same drag reported in two steps should land exactly where a
+        // single jump to the same final position would.
+        let mut sizes = vec![20, 20];
+        let state = ResizeState {
+            gutter: 0,
+            anchor: 10,
+            orig: (20, 20),
+        };
+        apply_resize(&mut sizes, &state, 12);
+        apply_resize(&mut sizes, &state, 15);
+        assert_eq!(sizes, vec![25, 15]);
+    }
+
+    #[test]
+    fn resize_clamps_to_minimum_pane_size() {
+        let mut sizes = vec![20, 20];
+        let state = ResizeState {
+            gutter: 0,
+            anchor: 50,
+            orig: (20, 20),
+        };
+        apply_resize(&mut sizes, &state, 0); // dragged far past the minimum
+        assert_eq!(sizes[0], super::MIN_PANE_SIZE);
+        assert_eq!(sizes[0] + sizes[1], 40);
+    }
+
+    #[test]
+    fn resize_is_a_noop_when_total_too_small_to_split() {
+        let mut sizes = vec![3, 3];
+        let state = ResizeState {
+            gutter: 0,
+            anchor: 10,
+            orig: (3, 3),
+        };
+        apply_resize(&mut sizes, &state, 20);
+        assert_eq!(sizes, vec![3, 3]);
     }
 }

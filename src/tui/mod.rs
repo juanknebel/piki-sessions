@@ -31,6 +31,11 @@ pub struct Tab {
     /// Daemon session id for the tab's first session (`None` when local).
     /// Used to persist the tab name across TUI restarts.
     pub id: Option<String>,
+    /// Each pane's size along the split direction, in terminal cells.
+    /// Rebuilt (evenly, or rescaled) by `normalize_sizes` whenever its
+    /// length doesn't match `panes.len()` or its sum doesn't match the
+    /// available space — so an empty vec here is always a valid start.
+    pub sizes: Vec<u16>,
 }
 
 impl Tab {

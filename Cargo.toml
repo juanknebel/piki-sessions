@@ -23,6 +23,7 @@ strum = { version = "0.28", features = ["derive"] }
 ratatui = "0.30"
 crossterm = "0.29"
 tui-term = "0.3"
+vt100 = "0.16"
 
 [patch.crates-io]
 vt100 = { git = "https://github.com/juanknebel/piki-vt100", branch = "main" }
