@@ -164,12 +164,20 @@ impl Command {
                 *ctx.tabs_sel = *ctx.active;
             }
             Command::ScrollMode => *ctx.scroll_mode = true,
-            Command::SplitVertical => {
-                cmd_split(ctx.tabs, *ctx.active, SplitDir::Vertical, ctx.spawn, ctx.names)
-            }
-            Command::SplitHorizontal => {
-                cmd_split(ctx.tabs, *ctx.active, SplitDir::Horizontal, ctx.spawn, ctx.names)
-            }
+            Command::SplitVertical => cmd_split(
+                ctx.tabs,
+                *ctx.active,
+                SplitDir::Vertical,
+                ctx.spawn,
+                ctx.names,
+            ),
+            Command::SplitHorizontal => cmd_split(
+                ctx.tabs,
+                *ctx.active,
+                SplitDir::Horizontal,
+                ctx.spawn,
+                ctx.names,
+            ),
             Command::NextPane => cmd_next_pane(ctx.tabs, *ctx.active),
             Command::Quit => *ctx.quit = true,
             Command::RenameTab => {
@@ -339,7 +347,9 @@ fn cmd_split(tabs: &mut [Tab], active: usize, dir: SplitDir, ctx: &SpawnCtx, nam
     let Some(tab) = tabs.get_mut(active) else {
         return;
     };
-    let new_id = ctx.daemon.map(|_| piki_multiplex::session::new_session_id());
+    let new_id = ctx
+        .daemon
+        .map(|_| piki_multiplex::session::new_session_id());
     let session = match spawn_session(ctx, new_id.clone()) {
         Ok(s) => s,
         Err(_) => return,

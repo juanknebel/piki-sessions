@@ -2,9 +2,7 @@ use std::io;
 use std::path::PathBuf;
 
 use crossterm::ExecutableCommand;
-use crossterm::event::{
-    KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
-};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -362,8 +360,14 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         assert!(
-            mouse_to_bytes(up, MouseProtocolMode::Press, MouseProtocolEncoding::Sgr, 1, 1)
-                .is_none()
+            mouse_to_bytes(
+                up,
+                MouseProtocolMode::Press,
+                MouseProtocolEncoding::Sgr,
+                1,
+                1
+            )
+            .is_none()
         );
     }
 

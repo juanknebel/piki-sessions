@@ -1,5 +1,5 @@
 use std::io;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossterm::ExecutableCommand;
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
@@ -31,6 +31,10 @@ use super::{Pane, SplitDir, Tab};
 /// Minimum cells a pane can be dragged down to, so a resize can't collapse
 /// one away (use Close for that).
 const MIN_PANE_SIZE: u16 = 4;
+
+/// Max gap between two clicks on the same tab label to count as a
+/// double-click (opens rename), rather than two unrelated tab switches.
+const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
 
 /// An in-progress gutter drag: which gutter (between pane `gutter` and
 /// `gutter + 1`), the pointer coordinate where the drag started, and the
@@ -221,6 +225,9 @@ pub fn run() -> anyhow::Result<()> {
     let mut last_gutter_areas: Vec<Rect> = Vec::new();
     let mut last_tab_label_rects: Vec<Rect> = Vec::new();
     let mut resizing: Option<ResizeState> = None;
+    // Tracks the last tab-label click (when, which tab) to recognize a
+    // second quick click on the same tab as a double-click.
+    let mut last_tab_click: Option<(Instant, usize)> = None;
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -607,6 +614,20 @@ pub fn run() -> anyhow::Result<()> {
                     if tabs.is_empty() {
                         continue;
                     }
+                    // Any modal overlay captures input exclusively, same as
+                    // it does for the keyboard below — otherwise a click
+                    // could silently switch `active` out from under an
+                    // open rename/search/palette and the wrong tab would
+                    // end up acted on.
+                    if rename.is_some()
+                        || search_mode
+                        || scroll_mode
+                        || tabs_open
+                        || panes_open
+                        || palette_open
+                    {
+                        continue;
+                    }
 
                     // An in-progress gutter drag claims every event until
                     // release, regardless of where the pointer lands.
@@ -630,13 +651,28 @@ pub fn run() -> anyhow::Result<()> {
                     }
 
                     // The tab bar is modal to clicks: a hit there always
-                    // just switches tabs, nothing else.
+                    // just switches tabs (or, on a quick second click of
+                    // the same tab, opens rename) — nothing else.
                     if matches!(me.kind, crossterm::event::MouseEventKind::Down(_))
                         && let Some(idx) = last_tab_label_rects
                             .iter()
                             .position(|r| hit(r, me.column, me.row))
                     {
+                        let now = Instant::now();
+                        let is_double_click = last_tab_click.is_some_and(|(t, i)| {
+                            i == idx && now.duration_since(t) < DOUBLE_CLICK_WINDOW
+                        });
                         active = idx;
+                        if is_double_click {
+                            last_tab_click = None;
+                            rename = Some(RenameState {
+                                pane: false,
+                                buffer: tabs[idx].name.clone(),
+                                fresh: true,
+                            });
+                        } else {
+                            last_tab_click = Some((now, idx));
+                        }
                         continue;
                     }
                     if active >= tabs.len() {
@@ -670,8 +706,9 @@ pub fn run() -> anyhow::Result<()> {
                     // A click focuses whichever pane it lands in.
                     if matches!(me.kind, crossterm::event::MouseEventKind::Down(_))
                         && tabs[active].panes.len() > 1
-                        && let Some(idx) =
-                            last_pane_areas.iter().position(|r| hit(r, me.column, me.row))
+                        && let Some(idx) = last_pane_areas
+                            .iter()
+                            .position(|r| hit(r, me.column, me.row))
                     {
                         tabs[active].focus = idx;
                     }
@@ -691,7 +728,10 @@ pub fn run() -> anyhow::Result<()> {
                         let (mode, encoding) = {
                             let parser = session.parser().lock();
                             let screen = parser.screen();
-                            (screen.mouse_protocol_mode(), screen.mouse_protocol_encoding())
+                            (
+                                screen.mouse_protocol_mode(),
+                                screen.mouse_protocol_encoding(),
+                            )
                         };
                         mouse_to_bytes(me, mode, encoding, col, row)
                     });
