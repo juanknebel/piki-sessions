@@ -5,6 +5,20 @@ Format loosely follows Keep a Changelog.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-24
+### Added
+- Mouse support in the TUI: click a pane to focus it, click a tab label to
+  switch tabs (double-click to rename it), drag the divider between panes
+  to resize them, and forward clicks/drags/scroll to the focused pane's own
+  app (vim, htop, tmux, ...) when it has negotiated xterm mouse reporting.
+### Fixed
+- Startup no longer reattaches to exited daemon sessions (which died
+  instantly and could leave `pks` exiting immediately with nothing shown),
+  and multi-pane tabs are now regrouped correctly across restarts instead
+  of scattering into one tab per pane.
+- Closing the last pane/tab (Ctrl+G x) now actually kills its session
+  instead of leaving it "live" in the daemon after `pks` exits.
+
 ## [0.2.0] - 2026-11-20
 ### Added
 - tmux-style TUI (`pks`): tabs, split panes, command palette, scrollback
