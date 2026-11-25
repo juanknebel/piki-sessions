@@ -33,6 +33,7 @@ pks shutdown --force    # force stop
   - `x` close pane or tab (quits if last)
   - `v` / `h` split pane vertically / horizontally
   - `o` next pane
+  - `f` toggle pane zoom (fills the tab with the focused pane)
   - `s` switch tab (list)
   - `w` list all panes as tab.pane + names (Enter jumps)
   - `[` scrollback mode (`/` search, `y` copy, `q` exit)
@@ -40,6 +41,16 @@ pks shutdown --force    # force stop
   - `,` / `R` rename tab / rename pane
   - `1`-`9` select tab
 - `Ctrl+Q` quit (detach from remote sessions)
+
+## Mouse
+
+- Click a pane to focus it; click a tab label in the status bar to switch
+  tabs, or double-click one to rename it.
+- Drag the divider between panes to resize them.
+- Scroll wheel: scrolls the scrollback (or forwards as arrow keys to an
+  alt-screen app that hasn't asked for mouse reporting).
+- If the focused pane's own app (vim, htop, tmux, …) has negotiated xterm
+  mouse reporting, clicks/drags/scroll are forwarded to it instead.
 
 ## Tab names
 
@@ -50,4 +61,4 @@ are not persisted.
 
 ## Status
 
-See `PLAN.md` for roadmap and progress.
+See `CHANGELOG.md` for progress by release.

@@ -4,6 +4,9 @@ All notable changes to this project are documented here.
 Format loosely follows Keep a Changelog.
 
 ## [Unreleased]
+### Added
+- Pane zoom (`Ctrl+G f`): fills the tab with the focused pane, leaving the
+  rest of the layout untouched underneath so un-zooming restores it exactly.
 
 ## [0.3.0] - 2026-11-24
 ### Added
