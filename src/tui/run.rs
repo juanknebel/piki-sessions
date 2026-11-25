@@ -46,6 +46,19 @@ struct ResizeState {
     orig: (u16, u16),
 }
 
+/// Which real pane indices to actually lay out and render, in order:
+/// every pane normally, or just the focused one when zoomed (a tab with
+/// only one pane ignores its own zoom flag — nothing to zoom into).
+/// Positions in `pane_areas`/`pane_inner_areas` line up with this list,
+/// not with `tab.panes` directly.
+pub fn effective_pane_indices(zoomed: bool, focus: usize, n: usize) -> Vec<usize> {
+    if zoomed && n > 1 {
+        vec![focus]
+    } else {
+        (0..n).collect()
+    }
+}
+
 /// Border for a pane: only the focused pane of a multi-pane tab gets one.
 /// Single-pane tabs render borderless at full area.
 pub fn pane_border(
@@ -184,6 +197,7 @@ pub fn run() -> anyhow::Result<()> {
                     name: names.assign(Some(&tab_id)),
                     id: Some(tab_id),
                     sizes: Vec::new(),
+                    zoomed: false,
                 });
             }
         }
@@ -222,6 +236,12 @@ pub fn run() -> anyhow::Result<()> {
     // since a draw always runs first in each loop iteration.
     let mut last_pane_areas: Vec<Rect> = Vec::new();
     let mut last_pane_inner_areas: Vec<Rect> = Vec::new();
+    // Maps a position in the two vecs above back to its real index in
+    // `tab.panes` (identity, except a zoomed tab collapses to one entry
+    // pointing at the focused pane); `last_focus_pos` is the focused
+    // pane's own position in them, for the mouse-forwarding lookup.
+    let mut last_pane_real_indices: Vec<usize> = Vec::new();
+    let mut last_focus_pos: usize = 0;
     let mut last_gutter_areas: Vec<Rect> = Vec::new();
     let mut last_tab_label_rects: Vec<Rect> = Vec::new();
     let mut resizing: Option<ResizeState> = None;
@@ -305,21 +325,31 @@ pub fn run() -> anyhow::Result<()> {
             // ones (click-to-focus and drag-to-resize hit-test against
             // these rects, computed once here rather than inside the
             // draw closure, since input handling needs them afterwards).
+            //
+            // `indices` maps each position in `pane_areas`/`pane_inner_areas`
+            // back to its real index in `tab.panes`: normally that's just
+            // 0..n, but a zoomed tab collapses it to the single focused
+            // pane, so the rest keep their real layout (in `sizes`) and
+            // state untouched — just unrendered — until un-zoomed.
             let n = tabs[active].panes.len().max(1);
+            let zoomed = tabs[active].zoomed && n > 1;
+            let indices = effective_pane_indices(tabs[active].zoomed, tabs[active].focus, n);
+            let eff_n = indices.len();
+            let eff_focus = if zoomed { 0 } else { tabs[active].focus };
             let split_dir = match tabs[active].split {
                 SplitDir::Horizontal => Direction::Horizontal,
                 SplitDir::Vertical => Direction::Vertical,
             };
-            let (pane_areas, gutter_areas): (Vec<Rect>, Vec<Rect>) = if n <= 1 {
+            let (pane_areas, gutter_areas): (Vec<Rect>, Vec<Rect>) = if eff_n <= 1 {
                 (vec![main_area], Vec::new())
             } else {
                 let total_dim = match split_dir {
                     Direction::Horizontal => main_area.width,
                     _ => main_area.height,
                 };
-                let usable = total_dim.saturating_sub(n as u16 - 1);
-                normalize_sizes(&mut tabs[active].sizes, n, usable);
-                let mut constraints = Vec::with_capacity(n * 2 - 1);
+                let usable = total_dim.saturating_sub(eff_n as u16 - 1);
+                normalize_sizes(&mut tabs[active].sizes, eff_n, usable);
+                let mut constraints = Vec::with_capacity(eff_n * 2 - 1);
                 for (i, &s) in tabs[active].sizes.iter().enumerate() {
                     if i > 0 {
                         constraints.push(Constraint::Length(1));
@@ -337,9 +367,10 @@ pub fn run() -> anyhow::Result<()> {
             let pane_inner_areas: Vec<Rect> = pane_areas
                 .iter()
                 .enumerate()
-                .map(|(i, &a)| {
-                    let title = (n > 1).then_some(tabs[active].panes[i].name.as_str());
-                    pane_border(n, tabs[active].focus, i, title)
+                .map(|(pos, &a)| {
+                    let real_idx = indices[pos];
+                    let title = (eff_n > 1).then_some(tabs[active].panes[real_idx].name.as_str());
+                    pane_border(eff_n, eff_focus, pos, title)
                         .map(|b| b.inner(a))
                         .unwrap_or(a)
                 })
@@ -405,6 +436,11 @@ pub fn run() -> anyhow::Result<()> {
             } else {
                 Span::styled("", Style::default())
             };
+            let zoom_span = if zoomed {
+                Span::styled(" │ ZOOM ", Style::default().fg(Color::Black).bg(Color::Red))
+            } else {
+                Span::styled("", Style::default())
+            };
             let metrics = if let Some(c) = *bat_cap_r {
                 format!(
                     "🔋 {}% {} │ CPU {:.0}% │ MEM {:.1}/{:.1}GB",
@@ -421,6 +457,7 @@ pub fn run() -> anyhow::Result<()> {
             }
             status_spans.push(prefix_span);
             status_spans.push(scroll_span);
+            status_spans.push(zoom_span);
             let left_para = Paragraph::new(Line::from(status_spans));
             let right_para = Paragraph::new(metrics)
                 .alignment(Alignment::Right)
@@ -432,21 +469,24 @@ pub fn run() -> anyhow::Result<()> {
 
             last_pane_areas = pane_areas.clone();
             last_pane_inner_areas = pane_inner_areas.clone();
+            last_pane_real_indices = indices.clone();
+            last_focus_pos = eff_focus;
             last_gutter_areas = gutter_areas.clone();
             last_tab_label_rects = tab_label_rects;
 
             terminal.draw(|f| {
                 let tab = &tabs[active];
-                for (i, pane) in tab.panes.iter().enumerate() {
-                    let area = pane_areas[i];
-                    let inner = pane_inner_areas[i];
-                    let title = (tab.panes.len() > 1).then_some(pane.name.as_str());
+                for (pos, &real_idx) in indices.iter().enumerate() {
+                    let pane = &tab.panes[real_idx];
+                    let area = pane_areas[pos];
+                    let inner = pane_inner_areas[pos];
+                    let title = (eff_n > 1).then_some(pane.name.as_str());
                     if inner.width >= 4 && inner.height >= 4 {
                         let _ = pane.session.resize(inner.height, inner.width);
                     }
                     let parser = pane.session.parser().lock();
                     let pt = PseudoTerminal::new(parser.screen());
-                    if let Some(block) = pane_border(tab.panes.len(), tab.focus, i, title) {
+                    if let Some(block) = pane_border(eff_n, eff_focus, pos, title) {
                         f.render_widget(block, area);
                     }
                     f.render_widget(pt, inner);
@@ -703,21 +743,26 @@ pub fn run() -> anyhow::Result<()> {
                         continue;
                     }
 
-                    // A click focuses whichever pane it lands in.
+                    // A click focuses whichever pane it lands in (mapped
+                    // through `last_pane_real_indices` since a zoomed tab's
+                    // single visible position isn't the real pane index).
                     if matches!(me.kind, crossterm::event::MouseEventKind::Down(_))
                         && tabs[active].panes.len() > 1
-                        && let Some(idx) = last_pane_areas
+                        && let Some(pos) = last_pane_areas
                             .iter()
                             .position(|r| hit(r, me.column, me.row))
+                        && let Some(&real_idx) = last_pane_real_indices.get(pos)
                     {
-                        tabs[active].focus = idx;
+                        tabs[active].focus = real_idx;
                     }
 
                     // Forward to the focused pane's app when it has asked
                     // for mouse reporting and the pointer is on its content
                     // (not its border/title); otherwise fall back to
                     // scrollback / the arrow-key heuristic for plain apps.
-                    let focus = tabs[active].focus;
+                    // `last_focus_pos` (not `tab.focus` directly) since the
+                    // inner-area vec is indexed by position, same mapping.
+                    let focus = last_focus_pos;
                     let session = tabs[active].session();
                     let forwarded = last_pane_inner_areas.get(focus).and_then(|inner| {
                         if !hit(inner, me.column, me.row) {
@@ -1047,6 +1092,7 @@ pub fn run() -> anyhow::Result<()> {
                                     KeyCode::Char(',') => Some(Command::RenameTab),
                                     KeyCode::Char('R') => Some(Command::RenamePane),
                                     KeyCode::Char('w') => Some(Command::ListPanes),
+                                    KeyCode::Char('f') => Some(Command::ToggleZoom),
                                     _ => None,
                                 };
                                 if let Some(cmd) = cmd {
@@ -1204,11 +1250,27 @@ fn copy_to_clipboard(text: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResizeState, apply_resize, pane_border};
+    use super::{ResizeState, apply_resize, effective_pane_indices, pane_border};
 
     #[test]
     fn solo_pane_has_no_border() {
         assert!(pane_border(1, 0, 0, None).is_none());
+    }
+
+    #[test]
+    fn zoom_collapses_to_the_focused_pane_only() {
+        assert_eq!(effective_pane_indices(true, 2, 4), vec![2]);
+    }
+
+    #[test]
+    fn zoom_is_a_noop_with_a_single_pane() {
+        // Nothing to zoom into — render the lone pane as usual.
+        assert_eq!(effective_pane_indices(true, 0, 1), vec![0]);
+    }
+
+    #[test]
+    fn unzoomed_covers_every_pane_in_order() {
+        assert_eq!(effective_pane_indices(false, 1, 4), vec![0, 1, 2, 3]);
     }
 
     #[test]

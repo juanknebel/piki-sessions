@@ -92,6 +92,7 @@ pub enum Command {
     RenameTab,
     RenamePane,
     ListPanes,
+    ToggleZoom,
 }
 
 impl Command {
@@ -110,6 +111,7 @@ impl Command {
             Command::RenameTab => "rename-tab",
             Command::RenamePane => "rename-pane",
             Command::ListPanes => "list-panes",
+            Command::ToggleZoom => "toggle-zoom",
         }
     }
 
@@ -128,6 +130,7 @@ impl Command {
             Command::RenameTab => "Rename tab",
             Command::RenamePane => "Rename pane",
             Command::ListPanes => "List panes",
+            Command::ToggleZoom => "Toggle pane zoom",
         }
     }
 
@@ -146,6 +149,7 @@ impl Command {
             Command::RenameTab => "Ctrl+G ,",
             Command::RenamePane => "Ctrl+G R",
             Command::ListPanes => "Ctrl+G w",
+            Command::ToggleZoom => "Ctrl+G f",
         }
     }
 
@@ -212,6 +216,11 @@ impl Command {
                     .iter()
                     .position(|&(ti, pi)| ti == *ctx.active && pi == focus)
                     .unwrap_or(0);
+            }
+            Command::ToggleZoom => {
+                if let Some(tab) = ctx.tabs.get_mut(*ctx.active) {
+                    tab.zoomed = !tab.zoomed;
+                }
             }
         }
     }
@@ -333,6 +342,7 @@ pub fn new_tab(ctx: &SpawnCtx, names: &mut TabNames) -> anyhow::Result<Tab> {
         name,
         id,
         sizes: Vec::new(),
+        zoomed: false,
     })
 }
 
@@ -356,6 +366,9 @@ fn cmd_split(tabs: &mut [Tab], active: usize, dir: SplitDir, ctx: &SpawnCtx, nam
     };
     let old_focus = tab.focus;
     tab.split = dir;
+    // A zoomed-in split would only ever show the new pane, hiding the
+    // result — unzoom so the user sees the new layout.
+    tab.zoomed = false;
     tab.panes.push(Pane {
         session,
         name: default_name(ctx.cmd),

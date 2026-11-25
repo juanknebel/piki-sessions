@@ -36,6 +36,10 @@ pub struct Tab {
     /// length doesn't match `panes.len()` or its sum doesn't match the
     /// available space — so an empty vec here is always a valid start.
     pub sizes: Vec<u16>,
+    /// When true, only the focused pane is drawn (at full tab size); the
+    /// rest keep their layout and state, just unrendered until un-zoomed.
+    /// Transient view state — never persisted, always starts `false`.
+    pub zoomed: bool,
 }
 
 impl Tab {
